@@ -1,7 +1,10 @@
 import QtQuick
+import Quickshell
+import Quickshell.Io
 import qs.Common
 import qs.Services
 import qs.DCommon.Widgets
+import qs.Modals.FileBrowser
 
 DListItem {
     id: root
@@ -9,6 +12,9 @@ DListItem {
     required property var entry
     required property int itemIndex
     required property var modal
+
+    property string pendingSaveText: ""
+    property bool saveDialogOpenPending: false
 
     signal copyRequested
     signal pasteRequested
@@ -29,9 +35,87 @@ DListItem {
     readonly property bool showPinAction: visibleEntryActions.includes("pin")
     readonly property bool showEditAction: visibleEntryActions.includes("edit")
     readonly property bool showDeleteAction: visibleEntryActions.includes("delete")
+    readonly property bool showSaveAsAction: ClipboardService.canEditEntry(entry) && typeof entry.id === "number"
     readonly property bool showPreviewAction: ClipboardService.canPreviewEntry(entry)
     readonly property bool showPinnedIndicator: effectivePinned && !showPinAction
-    readonly property bool showAnyAction: showCopyAction || showPasteAction || showPinAction || showEditAction || showDeleteAction || showPinnedIndicator || showPreviewAction
+    readonly property bool showAnyAction: showCopyAction || showPasteAction || showPinAction || showEditAction || showDeleteAction || showPinnedIndicator || showPreviewAction || showSaveAsAction
+
+    function openSaveDialog() {
+        saveDialogOpenPending = true;
+        saveBrowserLoader.active = true;
+        if (saveBrowserLoader.item) {
+            saveDialogOpenPending = false;
+            saveBrowserLoader.item.open();
+        }
+    }
+
+    function saveAs() {
+        if (!showSaveAsAction)
+            return;
+
+        const requestedId = entry.id;
+        DMSService.sendRequest("clipboard.getEntry", { "id": requestedId }, function (response) {
+            if (root.entry?.id !== requestedId)
+                return;
+            if (response.error || !response.result) {
+                ToastService.showError(I18n.tr("Failed to load clipboard entry", "clipboard editor: fetching the entry's full text failed"));
+                return;
+            }
+
+            const result = response.result;
+            const fullText = result.data ? root.modal.editorView.decodeEntryData(result.data) : result.preview ?? "";
+            if (!fullText && (root.entry.preview ?? "").length > 0) {
+                ToastService.showError(I18n.tr("Failed to load clipboard entry", "clipboard editor: fetching the entry's full text failed"));
+                return;
+            }
+
+            root.pendingSaveText = fullText;
+            root.openSaveDialog();
+        });
+    }
+
+    LazyLoader {
+        id: saveBrowserLoader
+        active: false
+        onLoaded: {
+            if (root.saveDialogOpenPending) {
+                root.saveDialogOpenPending = false;
+                item.open();
+            }
+        }
+
+        FileBrowserSurfaceModal {
+            browserTitle: I18n.tr("Save Clipboard Text")
+            bucket: "clipboard_save"
+            filters: ["*.txt"]
+            mode: "save"
+            defaultName: "clipboard.txt"
+            parentPopout: root.modal.popout ? root.modal.surfaceHost : null
+
+            onAccepted: paths => {
+                if (paths.length === 0)
+                    return;
+                saveFileView.path = "";
+                saveFileView.path = paths[0];
+                saveFileView.setText(root.pendingSaveText);
+            }
+            onDialogClosed: {
+                root.pendingSaveText = "";
+                saveBrowserLoader.active = false;
+            }
+        }
+    }
+
+    FileView {
+        id: saveFileView
+        blockWrites: true
+        preload: false
+        atomicWrites: true
+        printErrors: true
+
+        onSaved: ToastService.showInfo(I18n.tr("Clipboard text saved"))
+        onSaveFailed: error => ToastService.showError(I18n.tr("Failed to save clipboard text"))
+    }
 
     keyForwardTargets: [modal.modalFocusScope]
     firstInGroup: itemIndex === 0
@@ -100,6 +184,17 @@ DListItem {
 
         DActionButton {
             Keys.forwardTo: [root.modal.modalFocusScope]
+            iconName: "save"
+            Accessible.name: I18n.tr("Save As")
+            tooltipText: I18n.tr("Save As")
+            iconSize: Theme.iconSizeSmall
+            iconColor: root.contentColor
+            visible: root.showSaveAsAction
+            onClicked: root.saveAs()
+        }
+
+        DActionButton {
+            Keys.forwardTo: [root.modal.modalFocusScope]
             iconName: "push_pin"
             Accessible.name: root.effectivePinned ? I18n.tr("Unpin") : I18n.tr("Pin", "verb, keep an item pinned in place")
             iconSize: Theme.iconSizeSmall
@@ -129,9 +224,8 @@ DListItem {
             enabled: root.entryType !== "image"
 
             onClicked: {
-                if (entryType === "image") {
+                if (entryType === "image")
                     return;
-                }
                 editRequested();
             }
         }
